@@ -288,6 +288,70 @@ def scan_bar_v6(frame: np.ndarray) -> tuple[int | None, int | None]:
     return cursor, target
 
 
+def find_cursor_via_motion(frame_prev: np.ndarray,
+                           frame_curr: np.ndarray) -> int | None:
+    """
+    Detect the cursor as the column with the most pixel motion between two frames.
+    
+    The bar's endcaps and frame are STATIC -- they don't move between frames.
+    The cursor MOVES, so it's the only thing that produces a motion signal.
+    
+    Both frames must have identical shape (same bar_region capture).
+    Input frames are BGR.
+    """
+    if frame_prev is None or frame_curr is None:
+        return None
+    if frame_prev.shape != frame_curr.shape:
+        return None
+    
+    h, w = frame_curr.shape[:2]
+    
+    # Restrict to middle vertical band (skip top/bottom decorations)
+    y_start = max(0, h // 4)
+    y_end = min(h, h * 3 // 4)
+    if y_end <= y_start:
+        return None
+    
+    f1 = frame_prev[y_start:y_end].astype(np.int16)
+    f2 = frame_curr[y_start:y_end].astype(np.int16)
+    
+    # Per-pixel absolute difference, summed across BGR channels
+    diff = np.abs(f1 - f2).sum(axis=2)  # shape (band_h, w)
+    
+    # Sum changes per column to get motion intensity per x position
+    col_motion = diff.sum(axis=0).astype(np.float64)  # shape (w,)
+    
+    # Smooth so adjacent peaks (cursor's old + new position) merge into one
+    kernel_size = 7
+    kernel = np.ones(kernel_size) / kernel_size
+    smoothed = np.convolve(col_motion, kernel, mode='same')
+    
+    # Exclude leftmost/rightmost margins (endcaps may animate slightly)
+    margin = max(20, w // 50)
+    smoothed[:margin] = 0
+    smoothed[-margin:] = 0
+    
+    peak_value = smoothed.max()
+    if peak_value < 50:  # no meaningful motion
+        return None
+    
+    peak_x = int(np.argmax(smoothed))
+    return peak_x
+
+
+def scan_bar_motion(frame_prev: np.ndarray,
+                    frame_curr: np.ndarray) -> tuple[int | None, int | None]:
+    """
+    Scan bar using motion-based cursor detection + color-based target detection.
+    Returns (cursor_x, target_x).
+    
+    cursor_x will be None on the very first call (when frame_prev is None).
+    """
+    cursor = find_cursor_via_motion(frame_prev, frame_curr)
+    target = find_target_zone_multi_row(frame_curr)
+    return cursor, target
+
+
 
 def row_has_real_target(row: np.ndarray) -> bool:
     """Check if a row has a target zone cluster wide enough to be the real bar."""
@@ -451,14 +515,17 @@ def calibrate(monitor_idx: int | None):
         Image.fromarray(full_rgb).save(debug_path)
         print(f"[i] Full screenshot: {debug_path}")
 
-        # Live detection test: capture 10 frames rapidly to show if values change
+        # Live detection test: capture frames rapidly with MOTION-based cursor
         if bar_region:
-            print("\n[i] Live test: 10 rapid captures...")
-            for i in range(10):
-                time.sleep(0.05)
+            print("\n[i] Live test: motion-based cursor detection (15 frames)...")
+            print("    The cursor MUST be moving for this to work!")
+            prev_frame = None
+            for i in range(15):
+                time.sleep(0.04)
                 f = np.array(sct.grab(bar_region))[:, :, :3]
-                c, t = scan_bar_v6(f)
+                c, t = scan_bar_motion(prev_frame, f)
                 print(f"  Frame {i+1}: cursor={c} target={t}")
+                prev_frame = f
 
 
 def _debug_cursor(frame: np.ndarray):
@@ -537,6 +604,7 @@ def main_loop(monitor_idx: int | None, autocast: bool, deadzone: int, delay: flo
         last_cast_time = 0
         frame_count = 0
         no_detect_count = 0
+        prev_bar_frame = None  # For motion-based cursor detection
 
         while running:
             # ── MINIGAME ──────────────────────────────────────────
@@ -550,8 +618,10 @@ def main_loop(monitor_idx: int | None, autocast: bool, deadzone: int, delay: flo
                     if new_region is not None:
                         bar_region = new_region
                         frame = np.array(sct.grab(bar_region))[:, :, :3]
+                        prev_bar_frame = None  # reset motion baseline
                 
-                cursor, target = scan_bar_v6(frame)
+                cursor, target = scan_bar_motion(prev_bar_frame, frame)
+                prev_bar_frame = frame
 
                 if cursor is not None and target is not None:
                     no_detect_count = 0
@@ -597,6 +667,7 @@ def main_loop(monitor_idx: int | None, autocast: bool, deadzone: int, delay: flo
                     state = "MINIGAME"
                     frame_count = 0
                     no_detect_count = 0
+                    prev_bar_frame = None  # reset motion baseline
                     time.sleep(delay)
                     continue
 
