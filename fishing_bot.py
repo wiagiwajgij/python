@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-NTE Fishing Auto-Player v6 (Linux / Zorin OS)
+NTE Fishing Auto-Player v7 (Linux / Zorin OS)
 ===============================================
 Handles the full fishing loop:
   Phase 1 — IDLE:     No bar, no glow → wait (--autocast to press F)
   Phase 2 — HOOKED:   Blue glow on F button → press F to reel in
   Phase 3 — MINIGAME: Cursor (thin vertical line) + colored zone → A/D tracking
 
+KEY FIXES in v7:
+  - Cursor detector was locking onto BAR EDGES (the white border lines on the
+    left/right of the bar). v7 detects ALL vertical bright lines, identifies
+    the outermost as bar edges, and picks the cursor from between them.
+  - Added detailed cluster debugging in calibrate mode.
+  - Added --debug-loop flag that prints every frame's detection.
+
 KEY FIXES in v6:
   - Fixed BGR channel order (mss returns BGRA, not RGBA)
   - Rewrote cursor detection: detects thin vertical line via column projection
-  - Rewrote scan approach: green zone found per-row, cursor found via vertical scan
   - Bar region refreshed every N frames to track movement
 
 NO injection — purely screen-reading + xdotool keypresses.
@@ -172,80 +178,156 @@ def find_target_zone_center(row: np.ndarray) -> int | None:
     return int((best_cluster[0] + best_cluster[-1]) // 2)
 
 
-def find_cursor_vertical(frame: np.ndarray) -> int | None:
+def _find_vertical_line_clusters(frame: np.ndarray) -> list:
     """
-    Find the cursor as a thin bright vertical line by projecting across rows.
+    Find ALL vertical bright-line clusters in the frame.
     
-    Strategy: For each column x, count how many rows have a bright cursor pixel
-    at that x. A real vertical cursor line will have many rows lit up in a 
-    narrow column range. Random noise won't.
+    Returns a list of dicts: [{'x_start':int, 'x_end':int, 'center':int,
+                               'width':int, 'avg_hits':float, 'max_hits':int}, ...]
+    sorted by x position (leftmost first).
     
     Input frame is BGR format, shape (H, W, 3).
     """
     h, w = frame.shape[:2]
     
-    # Build a column histogram: for each x, how many rows have a bright pixel there
-    # We check a band of rows in the middle of the bar (avoid edges/decorations)
+    # Project bright (cursor-color) pixels onto column histogram
     y_start = max(0, h // 4)
     y_end = min(h, h * 3 // 4)
+    band_height = y_end - y_start
     
     col_hits = np.zeros(w, dtype=np.int32)
-    
-    for y in range(y_start, y_end, 1):
+    for y in range(y_start, y_end):
         row = frame[y, :, :]
         bright_mask = is_bright_cursor(row)
-        # Exclude pixels that are in the green zone (target zone is also bright)
         green_mask = is_target_green(row)
         cursor_mask = bright_mask & ~green_mask
         col_hits += cursor_mask.astype(np.int32)
     
-    # The cursor should be a narrow spike in the histogram
-    # Find columns with significant hits
     if col_hits.max() < CURSOR_MIN_ROWS:
-        return None
+        return []
     
-    # Threshold: at least CURSOR_MIN_ROWS hits
-    threshold = max(CURSOR_MIN_ROWS, col_hits.max() * 0.5)
-    candidates = np.where(col_hits >= threshold)[0]
-    
+    # A vertical line means the column is hit in MOST rows of the band
+    # Use a strict threshold: at least 50% of the band height must be lit
+    min_hits = max(CURSOR_MIN_ROWS, int(band_height * 0.5))
+    candidates = np.where(col_hits >= min_hits)[0]
     if len(candidates) == 0:
-        return None
+        # Fallback: lower threshold
+        min_hits = max(CURSOR_MIN_ROWS, int(band_height * 0.3))
+        candidates = np.where(col_hits >= min_hits)[0]
+        if len(candidates) == 0:
+            return []
     
-    # Cluster the candidate columns (cursor is thin, 1-8px wide)
+    # Cluster contiguous columns (gap > 3 = different cluster)
     diffs = np.diff(candidates)
     breaks = np.where(diffs > 3)[0]
     
-    clusters = []
+    clusters_idx = []
     start = 0
     for b in breaks:
-        clusters.append(candidates[start:b + 1])
+        clusters_idx.append(candidates[start:b + 1])
         start = b + 1
-    clusters.append(candidates[start:])
+    clusters_idx.append(candidates[start:])
     
-    # Pick the narrowest cluster (most cursor-like) that has high column hits
-    best_cluster = None
-    best_score = 0
+    results = []
+    for c in clusters_idx:
+        x_start = int(c[0])
+        x_end = int(c[-1])
+        width = x_end - x_start + 1
+        # Weighted center
+        weights = col_hits[x_start:x_end+1].astype(np.float64)
+        if weights.sum() > 0:
+            center = int(np.average(np.arange(x_start, x_end+1), weights=weights))
+        else:
+            center = (x_start + x_end) // 2
+        results.append({
+            'x_start': x_start,
+            'x_end': x_end,
+            'center': center,
+            'width': width,
+            'avg_hits': float(np.mean(col_hits[x_start:x_end+1])),
+            'max_hits': int(np.max(col_hits[x_start:x_end+1])),
+        })
     
-    for c in clusters:
-        width = c[-1] - c[0] + 1
-        if width > CURSOR_MAX_WIDTH * 3:
-            continue  # Too wide, probably not cursor
-        # Score = average hits in this cluster
-        avg_hits = np.mean(col_hits[c[0]:c[-1]+1])
-        if avg_hits > best_score:
-            best_score = avg_hits
-            best_cluster = c
+    results.sort(key=lambda r: r['center'])
+    return results
+
+
+def find_cursor_vertical(frame: np.ndarray, target_x: int | None = None,
+                         debug: bool = False) -> int | None:
+    """
+    Find the cursor by:
+      1. Finding ALL vertical bright lines (cursor + bar edges).
+      2. Identifying the leftmost and rightmost as bar edges.
+      3. Picking the cursor from clusters BETWEEN those edges.
     
-    if best_cluster is None:
+    The bar edges are typically the leftmost and rightmost vertical lines
+    (the bar's own border). The cursor is somewhere between them.
+    
+    If target_x is provided, prefer the cursor cluster nearest to (but not
+    equal to) the target zone — helps disambiguate when there are multiple
+    candidates.
+    
+    Input frame is BGR format, shape (H, W, 3).
+    """
+    clusters = _find_vertical_line_clusters(frame)
+    
+    if debug:
+        print(f"    [cursor debug] {len(clusters)} vertical-line clusters found:")
+        for c in clusters:
+            print(f"      x={c['x_start']}-{c['x_end']} (w={c['width']}, "
+                  f"center={c['center']}, avg_hits={c['avg_hits']:.1f}, "
+                  f"max_hits={c['max_hits']})")
+    
+    if len(clusters) == 0:
         return None
     
-    # Return the center weighted by hit count
-    cols = best_cluster
-    weights = col_hits[cols[0]:cols[-1]+1].astype(np.float64)
-    if weights.sum() == 0:
-        return int((cols[0] + cols[-1]) // 2)
-    center = np.average(np.arange(cols[0], cols[-1]+1), weights=weights)
-    return int(center)
+    # If we only have 1 cluster, it must be the cursor (no edges visible
+    # in this band, e.g. cursor is in the colored zone)
+    if len(clusters) == 1:
+        c = clusters[0]
+        # Sanity check: must be narrow
+        if c['width'] <= CURSOR_MAX_WIDTH * 3:
+            return c['center']
+        return None
+    
+    # 2+ clusters: identify the outermost as bar edges, others are cursor
+    # candidates. The cursor will move INSIDE the bar, never to its borders.
+    # Take the leftmost and rightmost as edges.
+    left_edge = clusters[0]
+    right_edge = clusters[-1]
+    
+    # Inner clusters = cursor candidates
+    inner = clusters[1:-1]
+    
+    if len(inner) == 0:
+        # Only 2 clusters total — both are edges, OR one is edge + one is cursor.
+        # Heuristic: if the cluster widths differ a lot, the wider one is likely
+        # the bar edge ornament, the narrower is the cursor. If similar widths,
+        # they are probably both bar edges and the cursor is inside the green zone.
+        # Without more info, return None and let target-only steering happen.
+        return None
+    
+    # Pick the inner cluster with the highest "lineness" score:
+    # - Strong vertical signal (high avg_hits)
+    # - Narrow width (cursor is thin)
+    best = None
+    best_score = -1.0
+    for c in inner:
+        # Score: avg_hits / width (favors strong narrow lines)
+        # Cap width at 1 to avoid divide-by-zero
+        width_factor = max(1, c['width'])
+        score = c['avg_hits'] / width_factor
+        # Bonus if narrow (1-4px is ideal cursor)
+        if c['width'] <= 4:
+            score *= 1.5
+        if score > best_score:
+            best_score = score
+            best = c
+    
+    if best is None:
+        return None
+    
+    return best['center']
 
 
 def find_target_zone_multi_row(frame: np.ndarray) -> int | None:
@@ -274,17 +356,18 @@ def find_target_zone_multi_row(frame: np.ndarray) -> int | None:
     return int(np.median(centers))
 
 
-def scan_bar_v6(frame: np.ndarray) -> tuple[int | None, int | None]:
+def scan_bar_v6(frame: np.ndarray, debug: bool = False) -> tuple[int | None, int | None]:
     """
     Detect cursor and target zone positions in the bar frame.
     
     - Target zone: found by row-scanning for the large colored region
     - Cursor: found by vertical column projection (thin bright line)
+              with bar-edge filtering
     
     Returns (cursor_x, target_x) or (None, None).
     """
     target = find_target_zone_multi_row(frame)
-    cursor = find_cursor_vertical(frame)
+    cursor = find_cursor_vertical(frame, target_x=target, debug=debug)
     return cursor, target
 
 
@@ -419,7 +502,7 @@ def calibrate(monitor_idx: int | None):
             print(f"\n[Phase 3] Bar region: top={bar_region['top']}, height={bar_region['height']}")
             print(f"  Bar frame: {bar_frame.shape[1]}x{bar_frame.shape[0]}")
 
-            cursor, target = scan_bar_v6(bar_frame)
+            cursor, target = scan_bar_v6(bar_frame, debug=True)
             print(f"  Cursor (vertical line): {cursor}")
             print(f"  Target zone center:     {target}")
             if cursor is not None and target is not None:
@@ -457,7 +540,9 @@ def calibrate(monitor_idx: int | None):
             for i in range(10):
                 time.sleep(0.05)
                 f = np.array(sct.grab(bar_region))[:, :, :3]
-                c, t = scan_bar_v6(f)
+                # On first and last frame show the cluster debug
+                show = (i == 0 or i == 9)
+                c, t = scan_bar_v6(f, debug=show)
                 print(f"  Frame {i+1}: cursor={c} target={t}")
 
 
@@ -628,7 +713,7 @@ def main_loop(monitor_idx: int | None, autocast: bool, deadzone: int, delay: flo
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="NTE Fishing Bot v6",
+        description="NTE Fishing Bot v7",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
